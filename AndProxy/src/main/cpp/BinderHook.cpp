@@ -1,0 +1,482 @@
+#include "BinderHook.h"
+#include "binder_proxy.h"
+#include "log.h"
+#include "Gloss.h"
+
+#include <thread>
+#include <utility>
+#include <sys/mman.h>
+
+thread_local BinderHook::TxnContext BinderHook::txnContext_;
+
+extern int ioctl_proxy(int fd, unsigned long request, void* args);
+
+BinderHook& BinderHook::instance() {
+    static BinderHook inst;
+    return inst;
+}
+
+BinderHook::~BinderHook() {
+    std::lock_guard<std::mutex> lock(mapMutex_);
+    for (auto& pair : addrMap_) {
+        free((void*)pair.second);
+    }
+    addrMap_.clear();
+}
+
+static void got_hook(uintptr_t got_addr, void *new_func, void **old_func) {
+    void **got_ptr = (void**)got_addr;
+    void *orig = *got_ptr;
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    uintptr_t page_start = got_addr & ~(page_size - 1);
+    if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE) == -1) {
+        LOGE("mprotect failed: %s", strerror(errno));
+        return;
+    }
+
+    *got_ptr = new_func;
+    mprotect((void*)page_start, page_size, PROT_READ);
+    if (old_func) *old_func = orig;
+}
+
+void BinderHook::init(JavaVM* vm) {
+    GHandle handle = GlossOpen("libbinder.so");
+    if (!handle) {
+        LOGE("GlossOpen failed");
+        return;
+    }
+
+    uintptr_t *got_addrs = NULL;
+    size_t got_count = 0;
+    if (!GlossGot(handle, "ioctl", &got_addrs, &got_count)) {
+        LOGE("GlossGot failed");
+        GlossClose(handle, true);
+        return;
+    }
+
+    if (got_count == 0) {
+        LOGE("No GOT entry found for ioctl");
+        free(got_addrs);
+        GlossClose(handle, true);
+        return;
+    }
+
+    LOGI("Found %zu GOT entries for ioctl", got_count);
+    LOGI("GOT entry address: %p, target: %p", (void*)got_addrs[0], (void*)ioctl_proxy);
+
+    got_hook((uintptr_t) got_addrs[0], (void *) ioctl_proxy, NULL);
+
+    free(got_addrs);
+    jvm_ = vm;
+    JNIEnv* env;
+    if (jvm_->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm_->AttachCurrentThread(&env, nullptr);
+    }
+
+    jclass dispatcherClass = env->FindClass("com/gumuluo/proxy/binder/BinderDispatcher");
+    dispatcherClass_ = (jclass)env->NewGlobalRef(dispatcherClass);
+    dispatchBeforeMid_ = env->GetStaticMethodID(dispatcherClass_, "dispatchBefore",
+                                                "(Ljava/lang/String;Ljava/lang/String;Landroid/os/Parcel;Landroid/os/Parcel;)Z");
+    dispatchAfterMid_ = env->GetStaticMethodID(dispatcherClass_, "dispatchAfter",
+                                               "(Ljava/lang/String;Ljava/lang/String;Landroid/os/Parcel;Landroid/os/Parcel;)Z");
+
+    env->DeleteLocalRef(dispatcherClass);
+}
+
+uintptr_t BinderHook::handle_free(uintptr_t addr) {
+    std::lock_guard<std::mutex> lock(mapMutex_);
+    auto it = addrMap_.find(addr);
+    if (it != addrMap_.end()) {
+        uintptr_t orig = it->first;
+        free((void*)it->second);
+        addrMap_.erase(it);
+        return orig;
+    }
+    return 0;
+}
+
+static inline std::string dotted_to_slash(const std::string& dotted) {
+    std::string slash = dotted;
+    std::replace(slash.begin(), slash.end(), '.', '/');
+    return slash;
+}
+
+// ==================== 新增回调管理函数 ====================
+void BinderHook::registerCallback(const std::string& serviceName, const std::string& methodName,
+                                  bool isBefore, BinderNativeCallback callback) {
+    std::string key = (isBefore ? "before#" : "after#") + serviceName + "#" + methodName;
+    std::lock_guard<std::mutex> lock(callbacksMutex_);
+    callbacks_[key] = std::move(callback);
+}
+
+void BinderHook::unregisterCallback(const std::string& serviceName, const std::string& methodName,
+                                    bool isBefore) {
+    std::string key = (isBefore ? "before#" : "after#") + serviceName + "#" + methodName;
+    std::lock_guard<std::mutex> lock(callbacksMutex_);
+    callbacks_.erase(key);
+}
+
+void BinderHook::addJavaCallback(const std::string& serviceName, const std::string& methodName,
+                                 bool isBefore) {
+    auto callback = [this, serviceName, methodName, isBefore](
+            binder_transaction_data* txn, bool isReply,
+            uint8_t** outData, size_t* outDataSize,
+            uint8_t** outOffsets, binder_size_t* outOffsetsSize) -> bool {
+        return callJavaDispatcher(serviceName, methodName, isBefore, txn,
+                                  outData, outDataSize, outOffsets, outOffsetsSize);
+    };
+    registerCallback(serviceName, methodName, isBefore, callback);
+}
+
+void BinderHook::removeJavaCallback(const std::string& serviceName, const std::string& methodName,
+                                    bool isBefore) {
+    unregisterCallback(serviceName, methodName, isBefore);
+}
+
+bool BinderHook::callJavaDispatcher(const std::string& serverName, const std::string& methodName,
+                                    bool isBefore, binder_transaction_data* txn,
+                                    uint8_t** outData, size_t* outDataSize,
+                                    uint8_t** outOffsets, binder_size_t* outOffsetsSize) {
+    JNIEnv* env;
+    bool needDetach = false;
+    if (jvm_->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm_->AttachCurrentThread(&env, nullptr);
+        needDetach = true;
+    }
+
+    env->ExceptionClear();
+
+    jclass parcelClass = env->FindClass("android/os/Parcel");
+    if (env->ExceptionCheck() || !parcelClass) {
+        env->ExceptionClear();
+        if (needDetach) jvm_->DetachCurrentThread();
+        return false;
+    }
+    jmethodID obtainMid = env->GetStaticMethodID(parcelClass, "obtain", "()Landroid/os/Parcel;");
+    jmethodID unmarshallMid = env->GetMethodID(parcelClass, "unmarshall", "([BII)V");
+    jmethodID setDataPositionMid = env->GetMethodID(parcelClass, "setDataPosition", "(I)V");
+    jmethodID recycleMid = env->GetMethodID(parcelClass, "recycle", "()V");
+
+    jobject dataParcel = env->CallStaticObjectMethod(parcelClass, obtainMid);
+    jbyteArray byteArray = env->NewByteArray(txn->data_size);
+    env->SetByteArrayRegion(byteArray, 0, txn->data_size, (const jbyte*)txn->data.ptr.buffer);
+    env->CallVoidMethod(dataParcel, unmarshallMid, byteArray, 0, (jint)txn->data_size);
+    env->CallVoidMethod(dataParcel, setDataPositionMid, 0);
+    env->DeleteLocalRef(byteArray);
+
+    jobject outParcel = env->CallStaticObjectMethod(parcelClass, obtainMid);
+    jmethodID setDataSizeMid = env->GetMethodID(parcelClass, "setDataSize", "(I)V");
+    if (setDataSizeMid) {
+        env->CallVoidMethod(outParcel, setDataSizeMid, 0);
+    }
+
+    jstring jServer = env->NewStringUTF(serverName.c_str());
+    jstring jMethod = env->NewStringUTF(methodName.c_str());
+
+    jboolean modified;
+    if (isBefore) {
+        modified = env->CallStaticBooleanMethod(dispatcherClass_, dispatchBeforeMid_,
+                                                jServer, jMethod, dataParcel, outParcel);
+    } else {
+        modified = env->CallStaticBooleanMethod(dispatcherClass_, dispatchAfterMid_,
+                                                jServer, jMethod, dataParcel, outParcel);
+    }
+
+    env->DeleteLocalRef(jServer);
+    env->DeleteLocalRef(jMethod);
+
+    bool result = false;
+    if (modified) {
+        jmethodID dataSizeMid = env->GetMethodID(parcelClass, "dataSize", "()I");
+        jint newSize = env->CallIntMethod(outParcel, dataSizeMid);
+        if (newSize > 0) {
+            jmethodID marshallMid = env->GetMethodID(parcelClass, "marshall", "()[B");
+            jbyteArray newData = (jbyteArray)env->CallObjectMethod(outParcel, marshallMid);
+            jsize newLen = env->GetArrayLength(newData);
+            uint8_t* newBuf = (uint8_t*)malloc(newLen);
+            env->GetByteArrayRegion(newData, 0, newLen, (jbyte*)newBuf);
+            env->DeleteLocalRef(newData);
+            *outData = newBuf;
+            *outDataSize = newLen;
+            *outOffsets = nullptr;
+            *outOffsetsSize = 0;
+            result = true;
+            LOGD("Java callback modified data, new size=%zu", newLen);
+        }
+    }
+
+    env->CallVoidMethod(dataParcel, recycleMid);
+    env->CallVoidMethod(outParcel, recycleMid);
+    env->DeleteLocalRef(dataParcel);
+    env->DeleteLocalRef(outParcel);
+    env->DeleteLocalRef(parcelClass);
+
+    if (needDetach) jvm_->DetachCurrentThread();
+    return result;
+}
+
+
+bool BinderHook::invokeJavaCallback(binder_transaction_data* txn, bool isReply,
+                                    uint8_t** outData, size_t* outDataSize,
+                                    uint8_t** outOffsets, binder_size_t* outOffsetsSize) {
+    if (!isReply) {
+        // 请求：获取服务名和方法名
+        std::string serverName;
+        auto itCache = serviceCache_.find(txn->target.handle);
+        if (itCache != serviceCache_.end()) {
+            serverName = itCache->second;
+        } else {
+            serverName = get_server_name(txn);
+            if (!serverName.empty()) {
+                serviceCache_[txn->target.handle] = serverName;
+            }
+        }
+        if (serverName.empty()) {
+            LOGD("Empty server name for request txn: code=%u", txn->code);
+            return false;
+        }
+
+        std::string methodName;
+        auto itMethod = methodCache_.find(txn->code);
+        if (itMethod != methodCache_.end()) {
+            methodName = itMethod->second;
+        } else {
+            std::string serverClass = dotted_to_slash(serverName) + "$Stub";
+            JNIEnv* env = nullptr;
+            bool needDetach = false;
+            if (jvm_->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+                jvm_->AttachCurrentThread(&env, nullptr);
+                needDetach = true;
+            }
+            methodName = get_transaction_name(env, serverClass.c_str(), txn->code);
+            if (needDetach) jvm_->DetachCurrentThread();
+            if (!methodName.empty()) {
+                methodCache_[txn->code] = methodName;
+            }
+        }
+        if (methodName.empty()) {
+            LOGD("Empty method name for code %u", txn->code);
+            return false;
+        }
+
+        // 保存到线程局部存储
+        txnContext_.serviceName = serverName;
+        txnContext_.methodName = methodName;
+
+        // 查找回调
+        std::string key = "before#" + serverName + "#" + methodName;
+        BinderNativeCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callbacksMutex_);
+            auto it = callbacks_.find(key);
+            if (it != callbacks_.end()) cb = it->second;
+        }
+        if (cb) {
+            return cb(txn, isReply, outData, outDataSize, outOffsets, outOffsetsSize);
+        }
+        return false;
+    }
+    else {
+        // 回复
+        std::string serverName = txnContext_.serviceName;
+        std::string methodName = txnContext_.methodName;
+        if (serverName.empty() || methodName.empty()) return false;
+
+        std::string key = "after#" + serverName + "#" + methodName;
+        BinderNativeCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callbacksMutex_);
+            auto it = callbacks_.find(key);
+            if (it != callbacks_.end()) cb = it->second;
+        }
+        bool result = false;
+        if (cb) {
+            result = cb(txn, isReply, outData, outDataSize, outOffsets, outOffsetsSize);
+        }
+        txnContext_.serviceName.clear();
+        txnContext_.methodName.clear();
+        return result;
+    }
+}
+
+void BinderHook::adjust_offsets(binder_transaction_data* txn, int delta) {
+    if (txn->offsets_size == 0) return;
+    auto* offs = (binder_size_t*)(uintptr_t)txn->data.ptr.offsets;
+    size_t count = txn->offsets_size / sizeof(binder_size_t);
+    for (size_t i = 0; i < count; ++i) {
+        offs[i] += delta;
+    }
+}
+
+bool BinderHook::replace_transaction_data(binder_transaction_data* txn,
+                                          const uint8_t* newData, size_t newDataSize,
+                                          const uint8_t* newOffsets, binder_size_t newOffsetsSize) {
+    // 如果 newData 就是原始缓冲区地址，说明已经原地修改，无需任何操作
+    if ((uintptr_t)newData == txn->data.ptr.buffer) {
+        LOGD("replace_transaction_data: in-place modified, no action");
+        return true;
+    }
+
+    LOGD("replace_transaction_data: newDataSize=%zu, old size=%llu", newDataSize, txn->data_size);
+    LOGD("replace_transaction_data: old buffer=%p, new buffer will be allocated", (void*)txn->data.ptr.buffer);
+
+    uint8_t* newDataBuf = (uint8_t*)malloc(newDataSize);
+    if (!newDataBuf) return false;
+    memcpy(newDataBuf, newData, newDataSize);
+    LOGD("replace_transaction_data: allocated new buffer at %p", newDataBuf);
+
+    binder_size_t* newOffsetsBuf = nullptr;
+    if (newOffsetsSize > 0) {
+        newOffsetsBuf = (binder_size_t*)malloc(newOffsetsSize);
+        if (!newOffsetsBuf) {
+            free(newDataBuf);
+            return false;
+        }
+        memcpy(newOffsetsBuf, newOffsets, newOffsetsSize);
+        LOGD("replace_transaction_data: allocated new offsets buffer at %p", newOffsetsBuf);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mapMutex_);
+        addrMap_[(uintptr_t)txn->data.ptr.buffer] = (uintptr_t)newDataBuf;
+    }
+
+    int delta = (int)newDataSize - (int)txn->data_size;
+    LOGD("replace_transaction_data: delta=%d", delta);
+
+    txn->data.ptr.buffer = (binder_uintptr_t)newDataBuf;
+    if (newOffsetsBuf) {
+        txn->data.ptr.offsets = (binder_uintptr_t)newOffsetsBuf;
+    }
+    txn->data_size = newDataSize;
+    if (newOffsetsSize != txn->offsets_size) {
+        txn->offsets_size = newOffsetsSize;
+        LOGD("replace_transaction_data: offsets_size changed to %llu", newOffsetsSize);
+    }
+
+    if (delta != 0) {
+        adjust_offsets(txn, delta);
+        LOGD("replace_transaction_data: offsets adjusted");
+    }
+
+    return true;
+}
+
+void BinderHook::process_write_commands(struct binder_write_read* bwr) {
+    void* ptr = (void*)(uintptr_t)bwr->write_buffer;
+    size_t remaining = bwr->write_size;
+
+    while (remaining >= sizeof(uint32_t)) {
+        uint32_t cmd = *(uint32_t*)ptr;
+        size_t data_len = get_cmd_data_size(cmd, 0);
+        if (remaining < sizeof(uint32_t) + data_len) break;
+
+        void* dataPtr = (char*)ptr + sizeof(uint32_t);
+        binder_transaction_data* txn = nullptr;
+        bool isTransaction = false;
+
+        if (cmd == BC_TRANSACTION || cmd == BC_REPLY) {
+            txn = (binder_transaction_data*)dataPtr;
+            isTransaction = true;
+        } else if (cmd == BC_TRANSACTION_SG || cmd == BC_REPLY_SG) {
+            auto* txn_sg = (binder_transaction_data_sg*)dataPtr;
+            txn = &txn_sg->transaction_data;
+            isTransaction = true;
+        } else if (cmd == BC_FREE_BUFFER) {
+            if (data_len >= sizeof(binder_uintptr_t)) {
+                binder_uintptr_t* addr = (binder_uintptr_t*)dataPtr;
+                uintptr_t orig = handle_free(*addr);
+                if (orig) *addr = orig;
+            }
+        }
+
+        if (isTransaction && txn) {
+            uint8_t* newData = nullptr;
+            size_t newDataSize = 0;
+            uint8_t* newOffsets = nullptr;
+            binder_size_t newOffsetsSize = 0;
+            // 请求：isReply = false
+            bool modified = invokeJavaCallback(txn, false, &newData, &newDataSize,
+                                               &newOffsets, &newOffsetsSize);
+            if (modified && newData) {
+                // 请求数据修改，长度可能变化，使用 replace_transaction_data
+                replace_transaction_data(txn, newData, newDataSize, newOffsets, newOffsetsSize);
+                free(newData);
+                if (newOffsets) free(newOffsets);
+            }
+        }
+
+        ptr = (char*)ptr + sizeof(uint32_t) + data_len;
+        remaining -= sizeof(uint32_t) + data_len;
+    }
+}
+
+void BinderHook::process_read_commands(struct binder_write_read* bwr) {
+    void* ptr = (void*)(uintptr_t)bwr->read_buffer;
+    size_t remaining = bwr->read_size;
+
+    while (remaining >= sizeof(uint32_t)) {
+        uint32_t cmd = *(uint32_t*)ptr;
+        size_t data_len = get_cmd_data_size(cmd, 1);
+        if (remaining < sizeof(uint32_t) + data_len) break;
+
+        void* dataPtr = (char*)ptr + sizeof(uint32_t);
+        binder_transaction_data* txn = nullptr;
+        bool isTransaction = false;
+
+        if (cmd == BR_TRANSACTION || cmd == BR_REPLY) {
+            txn = (binder_transaction_data*)dataPtr;
+            isTransaction = true;
+        } else if (cmd == BR_TRANSACTION_SEC_CTX) {
+            auto* sec = (binder_transaction_data_secctx*)dataPtr;
+            txn = &sec->transaction_data;
+            isTransaction = true;
+        }
+        // 注意：驱动不会返回 BR_FREE_BUFFER，只有 BC_FREE_BUFFER 由用户空间发送
+
+        if (isTransaction && txn) {
+//            LOGD("process_read_commands: handling %s, code=%u, data_size=%llu",
+//                 (cmd == BR_REPLY ? "BR_REPLY" : "BR_TRANSACTION"),
+//                 txn->code, txn->data_size);
+
+            uint8_t* newData = nullptr;
+            size_t newDataSize = 0;
+            uint8_t* newOffsets = nullptr;
+            binder_size_t newOffsetsSize = 0;
+            bool modified = invokeJavaCallback(txn, true, &newData, &newDataSize,
+                                               &newOffsets, &newOffsetsSize);
+            if (modified && newData) {
+                LOGD("process_read_commands: replace_transaction_data called");
+                replace_transaction_data(txn, newData, newDataSize, newOffsets, newOffsetsSize);
+                free(newData);
+                if (newOffsets) free(newOffsets);
+            } else if (modified) {
+                LOGD("process_read_commands: in-place modified, no replace");
+            }
+        }
+
+        ptr = (char*)ptr + sizeof(uint32_t) + data_len;
+        remaining -= sizeof(uint32_t) + data_len;
+    }
+}
+
+int BinderHook::process_ioctl(int fd, unsigned long request, void* args) {
+    if (request != BINDER_WRITE_READ) {
+        return ioctl(fd, request, args);
+    }
+
+    auto* bwr = (struct binder_write_read*)args;
+
+    if (bwr->write_size > 0 && bwr->write_buffer != 0) {
+        process_write_commands(bwr);
+    }
+
+    int ret = ioctl(fd, request, args);
+
+    if (bwr->read_size > 0 && bwr->read_buffer != 0) {
+        process_read_commands(bwr);
+    }
+
+    return ret;
+}

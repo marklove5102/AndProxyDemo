@@ -1,0 +1,315 @@
+#include <cstring>
+#include <malloc.h>
+#include <android/api-level.h>
+#include "binder_proxy.h"
+#include "log.h"
+
+size_t get_cmd_data_size(uint32_t cmd, int is_read) {
+    if (is_read) {
+        // BR_* 命令
+        switch (cmd) {
+            case BR_ERROR:
+            case BR_ACQUIRE_RESULT:
+                return sizeof(__s32);
+            case BR_TRANSACTION:
+            case BR_REPLY:
+                return sizeof(struct binder_transaction_data);
+            case BR_TRANSACTION_SEC_CTX:
+                return sizeof(struct binder_transaction_data_secctx);
+            case BR_INCREFS:
+            case BR_ACQUIRE:
+            case BR_RELEASE:
+            case BR_DECREFS:
+                return sizeof(struct binder_ptr_cookie);
+            case BR_ATTEMPT_ACQUIRE:
+                return sizeof(struct binder_pri_ptr_cookie);
+            case BR_DEAD_BINDER:
+            case BR_CLEAR_DEATH_NOTIFICATION_DONE:
+                return sizeof(binder_uintptr_t);
+            default:
+                // BR_OK, BR_NOOP, BR_TRANSACTION_COMPLETE, BR_DEAD_REPLY,
+                // BR_FAILED_REPLY, BR_SPAWN_LOOPER 等无数据
+                return 0;
+        }
+    } else {
+        // BC_* 命令
+        switch (cmd) {
+            case BC_TRANSACTION:
+            case BC_REPLY:
+                return sizeof(struct binder_transaction_data);
+            case BC_TRANSACTION_SG:
+            case BC_REPLY_SG:
+                return sizeof(struct binder_transaction_data_sg);
+            case BC_FREE_BUFFER:
+            case BC_DEAD_BINDER_DONE:
+                return sizeof(binder_uintptr_t);
+            case BC_INCREFS:
+            case BC_ACQUIRE:
+            case BC_RELEASE:
+            case BC_DECREFS:
+                return sizeof(__u32);
+            case BC_INCREFS_DONE:
+            case BC_ACQUIRE_DONE:
+                return sizeof(struct binder_ptr_cookie);
+            case BC_ATTEMPT_ACQUIRE:
+                return sizeof(struct binder_pri_desc);
+            case BC_REQUEST_DEATH_NOTIFICATION:
+            case BC_CLEAR_DEATH_NOTIFICATION:
+                return sizeof(struct binder_handle_cookie);
+            default:
+                // BC_REGISTER_LOOPER, BC_ENTER_LOOPER, BC_EXIT_LOOPER 无数据
+                return 0;
+        }
+    }
+}
+
+//binder_transaction_data* parse_next_txn(void*& ptr, size_t& remaining, int is_read) {
+//    if (ptr == nullptr || remaining < sizeof(uint32_t))
+//        return nullptr;
+//
+//    uint32_t cmd = *reinterpret_cast<uint32_t*>(ptr);
+//    size_t data_len = get_cmd_data_size(cmd, is_read);
+//
+//    // 检查剩余空间是否足够容纳命令头 + 数据
+//    if (remaining < sizeof(uint32_t) + data_len)
+//        return nullptr;
+//
+//    // 跳过命令码
+//    ptr = static_cast<char*>(ptr) + sizeof(uint32_t);
+//    remaining -= sizeof(uint32_t);
+//
+//    if (is_read) {
+//        // 读取缓冲区命令 (BR_*)
+//        switch (cmd) {
+//            case BR_TRANSACTION: {
+//                auto* tr = reinterpret_cast<binder_transaction_data*>(ptr);
+//                ptr = static_cast<char*>(ptr) + data_len;
+//                remaining -= data_len;
+//                return tr;
+//            }
+//            case BR_TRANSACTION_SEC_CTX: {
+//                auto* sec = reinterpret_cast<binder_transaction_data_secctx*>(ptr);
+//                auto* tr = &sec->transaction_data;
+//                ptr = static_cast<char*>(ptr) + data_len;
+//                remaining -= data_len;
+//                return tr;
+//            }
+//            case BR_REPLY: {
+//                auto* tr = reinterpret_cast<binder_transaction_data*>(ptr);
+//                ptr = static_cast<char*>(ptr) + data_len;
+//                remaining -= data_len;
+//                return tr;
+//            }
+//            default:
+//                // 非事务命令：跳过数据部分
+//                ptr = static_cast<char*>(ptr) + data_len;
+//                remaining -= data_len;
+//                return nullptr;
+//        }
+//    } else {
+//        // 写入缓冲区命令 (BC_*)
+//        switch (cmd) {
+//            case BC_TRANSACTION:
+//            case BC_REPLY: {
+//                auto* tr = reinterpret_cast<binder_transaction_data*>(ptr);
+//                ptr = static_cast<char*>(ptr) + data_len;
+//                remaining -= data_len;
+//                return tr;
+//            }
+//            case BC_TRANSACTION_SG:
+//            case BC_REPLY_SG: {
+//                auto* tr_sg = reinterpret_cast<binder_transaction_data_sg*>(ptr);
+//                auto* tr = &tr_sg->transaction_data;
+//                ptr = static_cast<char*>(ptr) + data_len;
+//                remaining -= data_len;
+//                return tr;
+//            }
+//            default:
+//                // 非事务命令：跳过数据部分
+//                ptr = static_cast<char*>(ptr) + data_len;
+//                remaining -= data_len;
+//                return nullptr;
+//        }
+//    }
+//}
+
+std::string get_transaction_name(JNIEnv* env, const char* class_name, int code) {
+    std::string result;
+
+    // 将点号分隔的类名转换为斜杠分隔（已在外部处理，但这里不再转换）
+    jclass targetClass = env->FindClass(class_name);
+    if (targetClass == nullptr) {
+        env->ExceptionClear();  // 清除异常，避免崩溃
+        return result;
+    }
+
+    // 获取所有声明的字段
+    jclass classClass = env->FindClass("java/lang/Class");
+    jmethodID getDeclaredFields = env->GetMethodID(classClass, "getDeclaredFields", "()[Ljava/lang/reflect/Field;");
+    jobjectArray fields = static_cast<jobjectArray>(env->CallObjectMethod(targetClass, getDeclaredFields));
+    env->DeleteLocalRef(classClass);
+    if (fields == nullptr) {
+        env->DeleteLocalRef(targetClass);
+        return result;
+    }
+
+    jsize len = env->GetArrayLength(fields);
+    for (jsize i = 0; i < len; ++i) {
+        jobject field = env->GetObjectArrayElement(fields, i);
+        if (field == nullptr) continue;
+
+        // 获取字段名
+        jclass fieldClass = env->GetObjectClass(field);
+        jmethodID getName = env->GetMethodID(fieldClass, "getName", "()Ljava/lang/String;");
+        jstring nameStr = static_cast<jstring>(env->CallObjectMethod(field, getName));
+        env->DeleteLocalRef(fieldClass);
+        if (nameStr == nullptr) {
+            env->DeleteLocalRef(field);
+            continue;
+        }
+
+        const char* name = env->GetStringUTFChars(nameStr, nullptr);
+        if (name == nullptr) {
+            env->DeleteLocalRef(nameStr);
+            env->DeleteLocalRef(field);
+            continue;
+        }
+
+        // 匹配前缀 "TRANSACTION_"
+        const char* prefix = "TRANSACTION_";
+        if (strncmp(name, prefix, 12) == 0) {
+            // 使用 JNI 直接获取静态 int 字段值，避免 Java 反射权限问题
+            jfieldID fieldID = env->GetStaticFieldID(targetClass, name, "I");
+            if (fieldID != nullptr) {
+                jint value = env->GetStaticIntField(targetClass, fieldID);
+                if (value == code) {
+                    result = name + 12;   // 去掉前缀
+                    env->ReleaseStringUTFChars(nameStr, name);
+                    env->DeleteLocalRef(nameStr);
+                    env->DeleteLocalRef(field);
+                    break;
+                }
+            } else {
+                // 清除可能的异常（如字段不是 int 类型）
+                env->ExceptionClear();
+            }
+        }
+
+        env->ReleaseStringUTFChars(nameStr, name);
+        env->DeleteLocalRef(nameStr);
+        env->DeleteLocalRef(field);
+    }
+
+    env->DeleteLocalRef(fields);
+    env->DeleteLocalRef(targetClass);
+    return result;
+}
+
+std::string get_server_name(const binder_transaction_data* txn) {
+    if (!txn || !txn->data.ptr.buffer || txn->data_size < 16) {
+        return "";
+    }
+
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(
+            static_cast<uintptr_t>(txn->data.ptr.buffer));
+    size_t size = txn->data_size;
+
+    // 辅助函数：从给定位置提取 UTF-16 字符串
+    auto extract_utf16 = [&](size_t offset, int32_t len) -> std::string {
+        if (offset + 4 + len * 2 > size) return "";
+        const uint16_t* name16 = reinterpret_cast<const uint16_t*>(base + offset + 4);
+        std::string result;
+        result.reserve(len);
+        for (int32_t i = 0; i < len; ++i) {
+            uint16_t ch = name16[i];
+            // 简单 UTF-16 到 UTF-8 转换
+            if (ch < 0x80) {
+                result.push_back(static_cast<char>(ch));
+            } else if (ch < 0x800) {
+                result.push_back(static_cast<char>(0xC0 | (ch >> 6)));
+                result.push_back(static_cast<char>(0x80 | (ch & 0x3F)));
+            } else {
+                result.push_back(static_cast<char>(0xE0 | (ch >> 12)));
+                result.push_back(static_cast<char>(0x80 | ((ch >> 6) & 0x3F)));
+                result.push_back(static_cast<char>(0x80 | (ch & 0x3F)));
+            }
+        }
+        return result;
+    };
+
+    // 首先寻找 "TSYS" 标志（即 flat_binder_object.hdr.type == BINDER_TYPE_BINDER）
+    // 注意：TSYS 在内存中是小端序：'T'=0x54, 'S'=0x53, 'Y'=0x59, 'S'=0x53 => 0x53595354
+    // 但在缓冲区中是按字节存储的，所以直接比较 4 个字节。
+    const uint32_t TSYS_MAGIC = 0x54535953;  // "TSYS" 的 ASCII 值
+    // 搜索范围：从偏移 8 开始（跳过 Parcel 头部），到 size - 8 结束
+    for (size_t offset = 8; offset + 8 <= size; ++offset) {
+        if (*(uint32_t*)(base + offset) == TSYS_MAGIC) {
+            // 找到 TSYS，紧接着 4 个字节是长度字段
+            size_t len_pos = offset + 4;
+            if (len_pos + 4 > size) continue;
+            int32_t nameLen = *(int32_t*)(base + len_pos);
+            // 长度合理性检查：服务名通常较长（>3），且不超过 512
+            if (nameLen > 3 && nameLen <= 256) {
+                // 提取字符串
+                std::string candidate = extract_utf16(len_pos, nameLen);
+                // 进一步验证：服务名通常以 "android." 开头，或以 "." 分隔的包名
+                // 但为了通用，只检查是否包含可打印 ASCII 字符，且没有控制字符
+                if (!candidate.empty()) {
+                    // 可选：检查是否包含 '.' 或常见服务名特征
+                    bool valid = true;
+                    for (char c : candidate) {
+                        if (c < 0x20 || c > 0x7E) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (valid && candidate.find('.') != std::string::npos) {
+                        return candidate;  // 返回第一个找到的服务名
+                    }
+                }
+            }
+        }
+    }
+
+    // 如果没找到，回退到原来的模糊搜索（但可以增强长度限制）
+    for (size_t offset = 0; offset + 6 <= size; ++offset) {
+        const int32_t* len_ptr = reinterpret_cast<const int32_t*>(base + offset);
+        int32_t nameLen = *len_ptr;
+        if (nameLen <= 3 || nameLen > 256) continue;  // 长度至少 4 个字符
+        size_t str_bytes = static_cast<size_t>(nameLen) * 2;
+        if (offset + 4 + str_bytes > size) continue;
+
+        const uint16_t* name16 = reinterpret_cast<const uint16_t*>(base + offset + 4);
+        bool valid = true;
+        for (int32_t i = 0; i < nameLen; ++i) {
+            uint16_t ch = name16[i];
+            if ((ch & 0xFF00) == 0) {
+                uint8_t lo = ch & 0xFF;
+                if (lo < 0x20 || lo > 0x7E) {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if (!valid) continue;
+
+        std::string result;
+        result.reserve(nameLen);
+        for (int32_t i = 0; i < nameLen; ++i) {
+            uint16_t ch = name16[i];
+            if (ch < 0x80) {
+                result.push_back(static_cast<char>(ch));
+            } else if (ch < 0x800) {
+                result.push_back(static_cast<char>(0xC0 | (ch >> 6)));
+                result.push_back(static_cast<char>(0x80 | (ch & 0x3F)));
+            } else {
+                result.push_back(static_cast<char>(0xE0 | (ch >> 12)));
+                result.push_back(static_cast<char>(0x80 | ((ch >> 6) & 0x3F)));
+                result.push_back(static_cast<char>(0x80 | (ch & 0x3F)));
+            }
+        }
+        return result;
+    }
+
+    return "";
+}
