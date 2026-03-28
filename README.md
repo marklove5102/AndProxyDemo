@@ -31,7 +31,7 @@ AndProxy 是一款 Android 底层拦截库，通过 **GOT Hook** 劫持 `libbind
 ## 📦 依赖
 
 - Android SDK / NDK (NDK r25+，CMake 3.22+)  
-- [GlossHook](https://github.com/XMDS/GlossHook) – 用于 GOT 表劫持  
+- Kernel版本大于5.10
 
 ---
 
