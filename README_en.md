@@ -31,7 +31,7 @@ AndProxy is a low‑level interception library for Android that hooks `ioctl` in
 ## 📦 Dependencies
 
 - Android SDK / NDK (NDK r25+, CMake 3.22+)  
-- [GlossHook](https://github.com/XMDS/GlossHook) – used for GOT patching  
+- Kernel Version >= 5.10 
 
 ---
 
@@ -239,7 +239,6 @@ This project is open‑sourced under the **GPL 2.0** license. See the [LICENSE](
 
 ## 🙏 Acknowledgments
 
-- GOT hook implementation based on [GlossHook](https://github.com/XMDS/GlossHook)  
 - Seccomp notification mechanism inspired by Linux kernel documentation and [Android source code](https://cs.android.com/)
 
 ---
