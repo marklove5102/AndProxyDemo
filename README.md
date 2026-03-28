@@ -239,7 +239,6 @@ C 接口定义在以下头文件中，供 Native 代码直接使用。
 
 ## 🙏 致谢
 
-- GOT Hook 实现基于 [GlossHook](https://github.com/XMDS/GlossHook)  
 - Seccomp 通知机制参考 Linux 内核文档及 [Android 源码](https://cs.android.com/)  
 
 ---
