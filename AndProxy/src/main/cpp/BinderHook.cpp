@@ -389,6 +389,8 @@ bool BinderHook::invokeJavaCallback(binder_transaction_data* txn, bool isReply,
             return false;
         }
 
+        LOGD("serverName:%s. methodName:%s", serverName.c_str(), methodName.c_str());
+
         // 保存到线程局部存储
         txnContext_.serviceName = serverName;
         txnContext_.methodName = methodName;
@@ -568,6 +570,11 @@ void BinderHook::process_read_commands(struct binder_write_read* bwr) {
 //            LOGD("process_read_commands: handling %s, code=%u, data_size=%llu",
 //                 (cmd == BR_REPLY ? "BR_REPLY" : "BR_TRANSACTION"),
 //                 txn->code, txn->data_size);
+
+            if (txn->code == 8) { // Transaction code 8 corresponds to getApplicationInfo in IPackageManager
+                 LOGD("process_read_commands: dumping data for code=8 (possibly getApplicationInfo)");
+                 dump((void*)(uintptr_t)txn->data.ptr.buffer, txn->data_size > 256 ? 256 : txn->data_size);
+            }
 
             uint8_t* newData = nullptr;
             size_t newDataSize = 0;
