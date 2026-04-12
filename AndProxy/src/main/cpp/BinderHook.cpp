@@ -311,11 +311,14 @@ bool BinderHook::invokeCallback(binder_transaction_data* txn, bool isReply,
         }
         if (methodName.empty()) return false;
 
-        LOGD("serverName: %s, Method name: %s, txn code: %d", serverName.c_str(), methodName.c_str(), txn->code);
+        LOGD("serverName: %s, Method name: %s, txn code: %d, flags: 0x%x", serverName.c_str(), methodName.c_str(), txn->code, txn->flags);
 
-        // 保存到线程局部存储
-        txnContext_.serviceName = serverName;
-        txnContext_.methodName = methodName;
+        // 保存到线程局部存储（如果是 TF_ONE_WAY，不需要保存，因为不会有回复）
+        bool isOneWay = (txn->flags & TF_ONE_WAY) != 0;
+        if (!isOneWay) {
+            txnContext_.serviceName = serverName;
+            txnContext_.methodName = methodName;
+        }
 
         std::string key = "before#" + serverName + "#" + methodName;
         BinderNativeCallback cb;
@@ -324,10 +327,18 @@ bool BinderHook::invokeCallback(binder_transaction_data* txn, bool isReply,
             auto it = callbacks_.find(key);
             if (it != callbacks_.end()) cb = it->second;
         }
+        bool result = false;
         if (cb) {
-            return cb(txn, isReply, outData, outDataSize);
+            result = cb(txn, isReply, outData, outDataSize);
         }
-        return false;
+
+        // 对于 TF_ONE_WAY 事务，立即清除上下文
+        if (isOneWay) {
+            txnContext_.serviceName.clear();
+            txnContext_.methodName.clear();
+        }
+
+        return result;
     } else {
         // 回复
         std::string serverName = txnContext_.serviceName;
@@ -532,6 +543,11 @@ void BinderHook::process_write_commands(struct binder_write_read* bwr) {
                 replace_transaction_data_with_rebuild(txn, newData, newDataSize);
                 free(newData);
             }
+            // For TF_ONE_WAY transactions, clear context immediately since there's no reply
+            if (txn->flags & TF_ONE_WAY) {
+                txnContext_.serviceName.clear();
+                txnContext_.methodName.clear();
+            }
         }
 
         ptr = (char*)ptr + sizeof(uint32_t) + data_len;
@@ -564,10 +580,16 @@ void BinderHook::process_read_commands(struct binder_write_read* bwr) {
         if (isTransaction && txn) {
             uint8_t* newData = nullptr;
             size_t newDataSize = 0;
-            bool modified = invokeCallback(txn, true, &newData, &newDataSize);
+            bool isReply = (cmd == BR_REPLY);  // BR_TRANSACTION is request, BR_REPLY is reply
+            bool modified = invokeCallback(txn, isReply, &newData, &newDataSize);
             if (modified && newData) {
                 replace_transaction_data_with_rebuild(txn, newData, newDataSize);
                 free(newData);
+            }
+            // For TF_ONE_WAY transactions, clear context immediately since there's no reply
+            if (txn->flags & TF_ONE_WAY) {
+                txnContext_.serviceName.clear();
+                txnContext_.methodName.clear();
             }
         }
 
