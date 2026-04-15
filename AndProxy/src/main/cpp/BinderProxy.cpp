@@ -101,14 +101,7 @@ Java_com_gumuluo_proxy_binder_BinderProxy_nativeExtractHandle(JNIEnv *env, jclas
     void* ibinderPtr = *reinterpret_cast<void**>(bpData);
     LOGD("nativeExtractHandle: BinderProxyNativeData at %p, IBinder* = %p", bpData, ibinderPtr);
 
-    // 2. 可选：dump 结构体内存，便于验证
-    constexpr size_t kDumpSize = 64;
-    LOGD("--- BinderProxyNativeData memory (first %zu bytes) ---", kDumpSize);
-    dump(bpData, kDumpSize);
-    LOGD("--- BpBinder memory (first 64 bytes) ---");
-    dump(ibinderPtr, 64);
-
-    // 3. 将 IBinder* 直接作为 BpBinder* 提取 handle
+    // 2. 将 IBinder* 直接作为 BpBinder* 提取 handle
     int32_t handle = nativeExtractHandle(ibinderPtr);
     LOGD("nativeExtractHandle: extracted handle = %d", handle);
     return static_cast<jint>(handle);
