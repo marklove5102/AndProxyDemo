@@ -434,7 +434,13 @@ int seccomp_hook_init(const int *syscall_list,
                       int num_entries,
                       int use_signal) {
     LOGD("seccomp_hook_init: called");
+    
     if (g_initialized) return 0;
+
+    if (prctl(PR_SET_DUMPABLE, 1) < 0) {
+        LOGE("prctl failed\n");
+        return -1;
+    }
 
     g_parent_pid = getpid();
 
